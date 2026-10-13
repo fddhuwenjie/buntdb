@@ -2,11 +2,14 @@ package buntdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2957,4 +2960,859 @@ func TestIssue112(t *testing.T) {
 		})
 		return err
 	})
+}
+
+// ---- 变更订阅（Change Feed）测试 ----
+
+// changesOpenPath 在临时目录中打开一个全新的持久化数据库。
+func changesOpenPath(t testing.TB) (*DB, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "data.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, path
+}
+
+func changesReopen(t testing.TB, db *DB, path string) *DB {
+	t.Helper()
+	if db != nil {
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func changesSet(t testing.TB, db *DB, key, value string,
+	opts ...*SetOptions) {
+	t.Helper()
+	var o *SetOptions
+	if len(opts) != 0 {
+		o = opts[0]
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set(key, value, o)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func changesDelete(t testing.TB, db *DB, key string) {
+	t.Helper()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.Delete(key)
+		if err == ErrNotFound {
+			return nil
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mustNextBatch 必须在 5 秒内取到下一个批次，否则测试失败。
+func mustNextBatch(t testing.TB, s *ChangeSubscriber) ChangeBatch {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b, err := s.Next(ctx)
+	if err != nil {
+		t.Fatalf("expected a change batch, got error: %v", err)
+	}
+	return b
+}
+
+// assertNoBatch 确认短时间内没有新批次产生。
+func assertNoBatch(t testing.TB, s *ChangeSubscriber) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, err := s.Next(ctx); err == nil {
+		t.Fatal("expected no change batch, but got one")
+	}
+}
+
+func assertBatch(t testing.TB, got ChangeBatch, cursor uint64, clear bool,
+	want []Change) {
+	t.Helper()
+	if got.Cursor != cursor {
+		t.Fatalf("cursor: expected %d, got %d", cursor, got.Cursor)
+	}
+	if got.Clear != clear {
+		t.Fatalf("clear: expected %v, got %v", clear, got.Clear)
+	}
+	if len(got.Changes) != len(want) {
+		t.Fatalf("batch %d changes length: expected %d, got %d (%+v)",
+			cursor, len(want), len(got.Changes), got.Changes)
+	}
+	for i := range want {
+		if got.Changes[i] != want[i] {
+			t.Fatalf("batch %d change %d: expected %+v, got %+v",
+				cursor, i, want[i], got.Changes[i])
+		}
+	}
+}
+
+func chSet(key, value string) Change {
+	return Change{Key: key, Value: value}
+}
+
+func chDel(key string) Change {
+	return Change{Key: key, Deleted: true}
+}
+
+// TestChangeFeedBasic 覆盖手动/托管事务的提交边界、同键跨提交不合并、
+// 删除、回滚与无变更事务不产生批次、DeleteAll 清空标记以及内存模式。
+func TestChangeFeedBasic(t *testing.T) {
+	db, _ := changesOpenPath(t)
+	defer db.Close()
+	sub, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// 游标 1：单键写入。
+	changesSet(t, db, "a", "1")
+	assertBatch(t, mustNextBatch(t, sub), 1, false, []Change{chSet("a", "1")})
+
+	// 游标 2：同一键的再次提交必须是独立批次，不能与游标 1 合并。
+	changesSet(t, db, "a", "2")
+	assertBatch(t, mustNextBatch(t, sub), 2, false, []Change{chSet("a", "2")})
+
+	// 游标 3：同一事务多个键按键名排序输出。
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("c", "4", nil); err != nil {
+			return err
+		}
+		_, _, err := tx.Set("b", "3", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertBatch(t, mustNextBatch(t, sub), 3, false,
+		[]Change{chSet("b", "3"), chSet("c", "4")})
+
+	// 游标 4：删除标记。
+	changesDelete(t, db, "a")
+	assertBatch(t, mustNextBatch(t, sub), 4, false, []Change{chDel("a")})
+
+	// 回滚的事务不产生批次。
+	rollbackErr := errors.New("rollback on purpose")
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("x", "9", nil); err != nil {
+			return err
+		}
+		return rollbackErr
+	}); err != rollbackErr {
+		t.Fatalf("expected rollback error, got %v", err)
+	}
+	// 无变更的托管事务、只读事务、仅创建索引的事务都不产生批次。
+	if err := db.Update(func(tx *Tx) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error { _, err := tx.Get("b"); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateIndex("idx", "*", IndexBinary); err != nil {
+		t.Fatal(err)
+	}
+	assertNoBatch(t, sub)
+
+	// 手动事务提交产生批次；手动回滚不产生。
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tx.Set("m", "1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	assertBatch(t, mustNextBatch(t, sub), 5, false, []Change{chSet("m", "1")})
+
+	tx, err = db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tx.Set("n", "1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoBatch(t, sub)
+
+	// DeleteAll 与同事务后续写入同属一个清空批次。
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.DeleteAll(); err != nil {
+			return err
+		}
+		_, _, err := tx.Set("z", "0", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertBatch(t, mustNextBatch(t, sub), 6, true, []Change{chSet("z", "0")})
+
+	// 单独的 DeleteAll 产生 Changes 为空、Clear 为 true 的批次。
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteAll() }); err != nil {
+		t.Fatal(err)
+	}
+	assertBatch(t, mustNextBatch(t, sub), 7, true, []Change{})
+
+	// 数据确实被清空。
+	if err := db.View(func(tx *Tx) error {
+		n, err := tx.Len()
+		if err != nil {
+			return err
+		}
+		if n != 0 {
+			t.Fatalf("expected empty database, got %d items", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 纯内存模式下订阅同样可用。
+	mem, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mem.Close()
+	msub, err := mem.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msub.Close()
+	changesSet(t, mem, "mem", "ok")
+	assertBatch(t, mustNextBatch(t, msub), 1, false, []Change{chSet("mem", "ok")})
+}
+
+// TestChangeFeedExpiration 验证后台过期删除以真实提交边界产生批次。
+func TestChangeFeedExpiration(t *testing.T) {
+	db, _ := changesOpenPath(t)
+	defer db.Close()
+	sub, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	changesSet(t, db, "keep", "1")
+	assertBatch(t, mustNextBatch(t, sub), 1, false,
+		[]Change{chSet("keep", "1")})
+
+	changesSet(t, db, "ephemeral", "x",
+		&SetOptions{Expires: true, TTL: 200 * time.Millisecond})
+	assertBatch(t, mustNextBatch(t, sub), 2, false,
+		[]Change{chSet("ephemeral", "x")})
+
+	// 后台管理器每秒执行一次过期清理，删除以独立批次到达。
+	b := mustNextBatch(t, sub)
+	if b.Cursor != 3 {
+		t.Fatalf("expected expiry batch cursor 3, got %d", b.Cursor)
+	}
+	found := false
+	for _, c := range b.Changes {
+		if c.Key == "ephemeral" {
+			if !c.Deleted {
+				t.Fatalf("expected ephemeral change to be a deletion: %+v", c)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expiry batch missing ephemeral key: %+v", b.Changes)
+	}
+
+	// 过期后读取应当 NotFound。
+	if err := db.View(func(tx *Tx) error {
+		_, err := tx.Get("ephemeral")
+		if err != ErrNotFound {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestChangeFeedResumeReopen 验证正常关闭重开后游标与批次内容可完整续读。
+func TestChangeFeedResumeReopen(t *testing.T) {
+	db, path := changesOpenPath(t)
+	const batches = 10
+	for i := 1; i <= batches; i++ {
+		changesSet(t, db, fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))
+	}
+	sub, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= batches; i++ {
+		assertBatch(t, mustNextBatch(t, sub), uint64(i), false,
+			[]Change{chSet(fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))})
+	}
+	sub.Close()
+	db = changesReopen(t, db, path)
+	defer db.Close()
+
+	// 从头订阅应得到完全一致的历史。
+	full, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer full.Close()
+	for i := 1; i <= batches; i++ {
+		assertBatch(t, mustNextBatch(t, full), uint64(i), false,
+			[]Change{chSet(fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))})
+	}
+
+	// 从中间游标续读只返回严格大于该游标的批次。
+	resume, err := db.SubscribeChanges(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resume.Close()
+	for i := 6; i <= batches; i++ {
+		assertBatch(t, mustNextBatch(t, resume), uint64(i), false,
+			[]Change{chSet(fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))})
+	}
+
+	// 超过最新游标属于非法请求。
+	if _, err := db.SubscribeChanges(batches + 1); err != ErrInvalidOperation {
+		t.Fatalf("expected ErrInvalidOperation, got %v", err)
+	}
+
+	// 两个订阅者都能收到重开后的新提交，游标在历史基础上连续递增。
+	changesSet(t, db, "k:11", "v:11")
+	assertBatch(t, mustNextBatch(t, full), 11, false,
+		[]Change{chSet("k:11", "v:11")})
+	assertBatch(t, mustNextBatch(t, resume), 11, false,
+		[]Change{chSet("k:11", "v:11")})
+}
+
+// TestChangeFeedShrinkResume 验证压缩期间的并发提交不丢批次，
+// 压缩后用已消费游标可在重开后续读，而压缩点之前的历史返回压缩错误。
+func TestChangeFeedShrinkResume(t *testing.T) {
+	db, path := changesOpenPath(t)
+	live, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+
+	// 20 个提交；键在 5 个键之间轮转以制造大量冗余 AOF 记录。
+	for i := 1; i <= 20; i++ {
+		changesSet(t, db, fmt.Sprintf("k%d", (i-1)%5), fmt.Sprintf("v%d", i))
+	}
+	for i := 1; i <= 20; i++ {
+		b := mustNextBatch(t, live)
+		if b.Cursor != uint64(i) {
+			t.Fatalf("expected cursor %d, got %d", i, b.Cursor)
+		}
+	}
+
+	// 确定性地制造“压缩期间提交”：Shrink 在捕获 endpos/快照游标（20）
+	// 后会释放锁并睡眠 250ms。趁该窗口持有一个写事务，阻塞其快照遍历，
+	// 待遍历恢复前再提交，使游标 21 必然落入 endpos 之后的 AOF 尾部。
+	shrinkDone := make(chan error, 1)
+	go func() { shrinkDone <- db.Shrink() }()
+	time.Sleep(100 * time.Millisecond)
+	holdTx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := holdTx.Set("k0", "v21", nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := holdTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-shrinkDone; err != nil {
+		t.Fatal(err)
+	}
+	assertBatch(t, mustNextBatch(t, live), 21, false,
+		[]Change{chSet("k0", "v21")})
+
+	// 压缩完成后的写入落到新文件，订阅不中断、游标连续。
+	for i := 22; i <= 30; i++ {
+		changesSet(t, db, fmt.Sprintf("k%d", (i-1)%5), fmt.Sprintf("v%d", i))
+	}
+	for i := 22; i <= 30; i++ {
+		if b := mustNextBatch(t, live); b.Cursor != uint64(i) {
+			t.Fatalf("expected cursor %d, got %d", i, b.Cursor)
+		}
+	}
+
+	// 压缩后数据状态正确。
+	for j := 0; j < 5; j++ {
+		want := fmt.Sprintf("v%d", 26+j)
+		if err := db.View(func(tx *Tx) error {
+			got, err := tx.Get(fmt.Sprintf("k%d", j))
+			if err != nil {
+				return err
+			}
+			if got != want {
+				t.Fatalf("k%d: expected %s, got %s", j, want, got)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	live.Close()
+	db = changesReopen(t, db, path)
+	defer db.Close()
+
+	// 快照游标为 20：从 20 续读可获得压缩期间及之后的全部批次。
+	resume, err := db.SubscribeChanges(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resume.Close()
+	for i := 21; i <= 30; i++ {
+		b := mustNextBatch(t, resume)
+		if b.Cursor != uint64(i) {
+			t.Fatalf("expected resumed cursor %d, got %d", i, b.Cursor)
+		}
+	}
+
+	// 压缩点之前的历史已经不存在。
+	if _, err := db.SubscribeChanges(19); err != ErrChangesCompacted {
+		t.Fatalf("expected ErrChangesCompacted, got %v", err)
+	}
+	if _, err := db.SubscribeChanges(0); err != ErrChangesCompacted {
+		t.Fatalf("expected ErrChangesCompacted, got %v", err)
+	}
+
+	// 续读位置仍随新提交连续推进。
+	changesSet(t, db, "k0", "v31")
+	assertBatch(t, mustNextBatch(t, resume), 31, false,
+		[]Change{chSet("k0", "v31")})
+}
+
+// TestChangeFeedSingleFileCopy 验证仅复制单个数据库文件即可在副本上续读。
+func TestChangeFeedSingleFileCopy(t *testing.T) {
+	db, path := changesOpenPath(t)
+	for i := 1; i <= 6; i++ {
+		changesSet(t, db, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	copyPath := filepath.Join(t.TempDir(), "copy.db")
+	src, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := os.Create(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cp, err := Open(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cp.Close()
+
+	// 副本上从头回放完整历史。
+	full, err := cp.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer full.Close()
+	for i := 1; i <= 6; i++ {
+		assertBatch(t, mustNextBatch(t, full), uint64(i), false,
+			[]Change{chSet(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))})
+	}
+
+	// 从已消费游标 3 续读，并接收副本上的新提交 7。
+	resume, err := cp.SubscribeChanges(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resume.Close()
+	for i := 4; i <= 6; i++ {
+		if b := mustNextBatch(t, resume); b.Cursor != uint64(i) {
+			t.Fatalf("expected cursor %d, got %d", i, b.Cursor)
+		}
+	}
+	changesSet(t, cp, "k7", "v7")
+	assertBatch(t, mustNextBatch(t, full), 7, false, []Change{chSet("k7", "v7")})
+	assertBatch(t, mustNextBatch(t, resume), 7, false, []Change{chSet("k7", "v7")})
+
+	// 副本数据完整。
+	if err := cp.View(func(tx *Tx) error {
+		n, err := tx.Len()
+		if err != nil {
+			return err
+		}
+		if n != 7 {
+			t.Fatalf("expected 7 items, got %d", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestChangeFeedSlowSubscriber 验证慢订阅者不阻塞写入、不丢历史，
+// 多个订阅者相互独立，关闭一个不影响其他订阅者。
+func TestChangeFeedSlowSubscriber(t *testing.T) {
+	db, _ := changesOpenPath(t)
+	defer db.Close()
+
+	slow, err := db.SubscribeChanges(0) // 全程不读取，制造积压
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.Close()
+
+	const n = 2000
+	fastBatches := make([]ChangeBatch, 0, n)
+	fastDone := make(chan struct{})
+	go func() {
+		defer close(fastDone)
+		for i := 0; i < n; i++ {
+			fastBatches = append(fastBatches, mustNextBatch(t, fast))
+		}
+	}()
+
+	start := time.Now()
+	for i := 1; i <= n; i++ {
+		if err := db.Update(func(tx *Tx) error {
+			_, _, err := tx.Set("k", fmt.Sprintf("v%d", i), nil)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("writes blocked for too long while subscriber paused: %v", elapsed)
+	}
+	select {
+	case <-fastDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fast subscriber did not receive all batches")
+	}
+	for i, b := range fastBatches {
+		if b.Cursor != uint64(i+1) {
+			t.Fatalf("fast batch %d: expected cursor %d, got %d",
+				i, i+1, b.Cursor)
+		}
+	}
+
+	// 关闭慢订阅者不影响快订阅者接收后续提交。
+	if err := slow.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := slow.Close(); err != nil { // 可重复关闭
+		t.Fatal(err)
+	}
+	changesSet(t, db, "k", fmt.Sprintf("v%d", n+1))
+	if b := mustNextBatch(t, fast); b.Cursor != n+1 {
+		t.Fatalf("expected cursor %d, got %d", n+1, b.Cursor)
+	}
+
+	// 新订阅者仍可从内存历史中取到积压的全部批次。
+	fresh, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	for i := 1; i <= n+1; i++ {
+		if b := mustNextBatch(t, fresh); b.Cursor != uint64(i) {
+			t.Fatalf("fresh batch: expected cursor %d, got %d", i, b.Cursor)
+		}
+	}
+
+	// 关闭后积压历史仍可完整排空，排空之后再读取返回明确的关闭错误。
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	for i := 1; i <= n; i++ {
+		b, err := slow.Next(drainCtx)
+		if err != nil {
+			t.Fatalf("slow subscriber lost batch %d: %v", i, err)
+		}
+		if b.Cursor != uint64(i) {
+			t.Fatalf("slow batch: expected cursor %d, got %d", i, b.Cursor)
+		}
+	}
+	drainCancel()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := slow.Next(ctx); err != ErrSubscriberClosed {
+		t.Fatalf("expected ErrSubscriberClosed, got %v", err)
+	}
+}
+
+// TestChangeFeedCancelAndClose 覆盖等待取消、数据库关闭及时结束、
+// 订阅者关闭解除阻塞以及非法订阅参数。
+func TestChangeFeedCancelAndClose(t *testing.T) {
+	db, _ := changesOpenPath(t)
+
+	sub, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// 超时取消。
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	if _, err := sub.Next(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+	cancel()
+
+	// 主动取消。
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel2()
+	}()
+	start := time.Now()
+	if _, err := sub.Next(ctx2); err != context.Canceled {
+		t.Fatalf("expected Canceled, got %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("cancel took too long: %v", d)
+	}
+
+	// 数据库关闭后阻塞中的 Next 及时结束。
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		if err := db.Close(); err != nil {
+			t.Errorf("db close: %v", err)
+		}
+	}()
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel3()
+	start = time.Now()
+	if _, err := sub.Next(ctx3); err != ErrDatabaseClosed {
+		t.Fatalf("expected ErrDatabaseClosed, got %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("close did not unblock Next promptly: %v", d)
+	}
+	if _, err := db.SubscribeChanges(0); err != ErrDatabaseClosed {
+		t.Fatalf("expected ErrDatabaseClosed, got %v", err)
+	}
+
+	// 订阅者关闭解除阻塞。
+	db2, _ := changesOpenPath(t)
+	defer db2.Close()
+	sub2, err := db2.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		if err := sub2.Close(); err != nil {
+			t.Errorf("sub close: %v", err)
+		}
+	}()
+	ctx4, cancel4 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel4()
+	if _, err := sub2.Next(ctx4); err != ErrSubscriberClosed {
+		t.Fatalf("expected ErrSubscriberClosed, got %v", err)
+	}
+
+	// 未来游标非法。
+	if _, err := db2.SubscribeChanges(1); err != ErrInvalidOperation {
+		t.Fatalf("expected ErrInvalidOperation, got %v", err)
+	}
+}
+
+// TestChangeFeedShrinkFailure 验证压缩失败后原文件与订阅不受影响，
+// 失败状态可以恢复，随后压缩成功且游标仍可续读。
+func TestChangeFeedShrinkFailure(t *testing.T) {
+	db, path := changesOpenPath(t)
+	sub, err := db.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	for i := 1; i <= 10; i++ {
+		changesSet(t, db, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+	for i := 1; i <= 10; i++ {
+		if b := mustNextBatch(t, sub); b.Cursor != uint64(i) {
+			t.Fatalf("expected cursor %d, got %d", i, b.Cursor)
+		}
+	}
+
+	// 在临时文件路径放置目录，使 Shrink 在创建临时文件时确定性失败。
+	tmpPath := path + ".tmp"
+	if err := os.Mkdir(tmpPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Shrink(); err == nil {
+		t.Fatal("expected shrink to fail when tmp path is a directory")
+	}
+	// 失败后不能遗留在途压缩状态。
+	if err := db.Shrink(); err == ErrShrinkInProcess {
+		t.Fatal("shrink remained in-process after a failure")
+	}
+
+	// 数据库仍然可读可写，订阅不中断、游标连续。
+	if err := db.View(func(tx *Tx) error {
+		n, err := tx.Len()
+		if err != nil {
+			return err
+		}
+		if n != 10 {
+			t.Fatalf("expected 10 items after failed shrink, got %d", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	changesSet(t, db, "k11", "v11")
+	assertBatch(t, mustNextBatch(t, sub), 11, false,
+		[]Change{chSet("k11", "v11")})
+
+	// 移除故障注入后压缩应当成功。
+	if err := os.RemoveAll(tmpPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Shrink(); err != nil {
+		t.Fatalf("retry shrink failed: %v", err)
+	}
+	changesSet(t, db, "k12", "v12")
+	assertBatch(t, mustNextBatch(t, sub), 12, false,
+		[]Change{chSet("k12", "v12")})
+
+	// 压缩失败后又成功压缩：重开数据完整、游标可续读。
+	sub.Close()
+	db = changesReopen(t, db, path)
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		n, err := tx.Len()
+		if err != nil {
+			return err
+		}
+		if n != 12 {
+			t.Fatalf("expected 12 items after reopen, got %d", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resume, err := db.SubscribeChanges(11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resume.Close()
+	assertBatch(t, mustNextBatch(t, resume), 12, false,
+		[]Change{chSet("k12", "v12")})
+	changesSet(t, db, "k13", "v13")
+	assertBatch(t, mustNextBatch(t, resume), 13, false,
+		[]Change{chSet("k13", "v13")})
+}
+
+// TestChangeFeedSaveLoadCompat 验证内存快照 Save/Load 行为保持兼容，
+// 快照不携带提交边界，且索引与遍历在订阅存在时照常工作。
+func TestChangeFeedSaveLoad(t *testing.T) {
+	src, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		changesSet(t, src, fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))
+	}
+	snapPath := filepath.Join(t.TempDir(), "snap.db")
+	f, err := os.Create(snapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Save(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	sf, err := os.Open(snapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Load(sf); err != nil {
+		t.Fatal(err)
+	}
+	if err := sf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.View(func(tx *Tx) error {
+		n, err := tx.Len()
+		if err != nil {
+			return err
+		}
+		if n != 5 {
+			t.Fatalf("expected 5 loaded items, got %d", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 快照不重建历史：订阅只看到 Load 之后的新提交，游标从 1 开始。
+	sub, err := dst.SubscribeChanges(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// 索引与遍历在订阅者存活时保持原有行为。
+	if err := dst.CreateIndex("idx", "k:*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	changesSet(t, dst, "k:5", "v:5")
+	assertBatch(t, mustNextBatch(t, sub), 1, false,
+		[]Change{chSet("k:5", "v:5")})
+	keys := 0
+	if err := dst.View(func(tx *Tx) error {
+		return tx.Ascend("idx", func(key, value string) bool {
+			keys++
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if keys != 6 {
+		t.Fatalf("expected 6 indexed items, got %d", keys)
+	}
 }

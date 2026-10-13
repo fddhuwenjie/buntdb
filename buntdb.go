@@ -6,6 +6,7 @@ package buntdb
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -60,6 +61,15 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrChangesCompacted is returned by SubscribeChanges when the requested
+	// change history no longer exists, usually because a shrink discarded the
+	// portion of the append-only file that contained the changes.
+	ErrChangesCompacted = errors.New("requested change history has been compacted")
+
+	// ErrSubscriberClosed is returned from ChangeSubscriber.Next when the
+	// subscriber has been closed.
+	ErrSubscriberClosed = errors.New("subscriber closed")
 )
 
 const useAbsEx = true
@@ -80,6 +90,12 @@ type DB struct {
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+
+	// 变更订阅相关状态。除 closeCh 自身外，以下字段均由 mu 保护。
+	changeHead uint64              // 最近一次成功提交批次的连续游标
+	changeLog  []ChangeBatch       // 进程内保留的历史批次（游标连续递增）
+	subs       []*ChangeSubscriber // 当前存活的变更订阅者
+	closeCh    chan struct{}       // 数据库关闭时关闭，用于唤醒等待中的订阅者
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -143,6 +159,7 @@ type exctx struct {
 // If the file does not exist then it will be created automatically.
 func Open(path string) (*DB, error) {
 	db := &DB{}
+	db.closeCh = make(chan struct{})
 	// initialize trees and indexes
 	db.keys = btreeNew(lessCtx(nil))
 	db.exps = btreeNew(lessCtx(&exctx{db}))
@@ -183,6 +200,9 @@ func (db *DB) Close() error {
 		return ErrDatabaseClosed
 	}
 	db.closed = true
+	// 立即广播关闭事件，让阻塞在 Next 上的订阅者及时结束，
+	// 即使随后的文件 Sync/Close 耗时也不受影响。
+	close(db.closeCh)
 	if db.persist {
 		db.file.Sync() // do a sync but ignore the error
 		if err := db.file.Close(); err != nil {
@@ -243,7 +263,7 @@ func (db *DB) Load(rd io.Reader) error {
 		// cannot load into databases that persist to disk
 		return ErrPersistenceActive
 	}
-	_, err := db.readLoad(rd, time.Now())
+	_, err := db.readLoad(rd, time.Now(), false)
 	return err
 }
 
@@ -664,6 +684,9 @@ func (db *DB) Shrink() error {
 	if err != nil {
 		return err
 	}
+	// 快照开始前的变更游标：快照 SET 只代表状态，游标之后的提交
+	// 会通过尾部追加的方式保留在新文件中。
+	snapCursor := db.changeHead
 	db.mu.Unlock()
 	time.Sleep(time.Second / 4) // wait just a bit before starting
 	f, err := os.Create(tmpname)
@@ -727,6 +750,13 @@ func (db *DB) Shrink() error {
 		if db.closed {
 			return ErrDatabaseClosed
 		}
+		// 写入快照边界标记（位于快照 SET 之后、压缩期间新增的尾部记录之前）。
+		// 数据库从未有过提交时保持空文件，以兼容既有的空库压缩行为。
+		if db.changeHead > 0 {
+			if _, err := f.Write(appendChangeSnapshot(nil, snapCursor)); err != nil {
+				return err
+			}
+		}
 		// We are going to open a new version of the aof file so that we do
 		// not change the seek position of the previous. This may cause a
 		// problem in the future if we choose to use syscall file locking.
@@ -789,8 +819,13 @@ func renameFile(src, dest string) error {
 // readLoad reads from the reader and loads commands into the database.
 // modTime is the modified time of the reader, should be no greater than
 // the current time.Now().
+// When trackChanges is true, buntcommit/buntsnapshot markers rebuild the
+// in-memory change log and change head; this is used when opening an
+// append-only database file. The public Load() passes false because memory
+// snapshots do not carry commit boundaries.
 // Returns the number of bytes of the last command read and the error if any.
-func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
+func (db *DB) readLoad(rd io.Reader, modTime time.Time,
+	trackChanges bool) (n int64, err error) {
 	defer func() {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -800,6 +835,10 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 	data := make([]byte, 4096)
 	parts := make([]string, 0, 8)
 	r := bufio.NewReader(rd)
+	// 尚未遇到提交标记的累积变更，遇到 buntcommit 时收敛为一个批次。
+	var logHead uint64
+	pending := make(map[string]Change)
+	var pendingClear bool
 	for {
 		// peek at the first byte. If it's a 'nul' control character then
 		// ignore it and move to the next byte.
@@ -943,6 +982,11 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			} else {
 				db.insertIntoDatabase(&dbItem{key: parts[1], val: parts[2]})
 			}
+			if trackChanges {
+				// 按真实提交记录该写入；即便加载时已过期，也忠实还原
+				// 历史上这次 SET 提交（过期删除会由后续提交另行体现）。
+				pending[parts[1]] = Change{Key: parts[1], Value: parts[2]}
+			}
 		} else if (parts[0][0] == 'd' || parts[0][0] == 'D') &&
 			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
 			(parts[0][2] == 'l' || parts[0][2] == 'L') {
@@ -951,11 +995,47 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 				return totalSize, ErrInvalid
 			}
 			db.deleteFromDatabase(&dbItem{key: parts[1]})
+			if trackChanges {
+				pending[parts[1]] = Change{Key: parts[1], Deleted: true}
+			}
 		} else if (parts[0][0] == 'f' || parts[0][0] == 'F') &&
 			strings.ToLower(parts[0]) == "flushdb" {
 			db.keys = btreeNew(lessCtx(nil))
 			db.exps = btreeNew(lessCtx(&exctx{db}))
 			db.idxs = make(map[string]*index)
+			if trackChanges {
+				// flushdb 总是一个事务内的首条记录，重置累积状态。
+				pending = make(map[string]Change)
+				pendingClear = true
+			}
+		} else if trackChanges && strings.EqualFold(parts[0], "buntcommit") {
+			// 提交边界标记：把累积的记录收敛为一个连续游标批次。
+			if len(parts) != 2 {
+				return totalSize, ErrInvalid
+			}
+			cursor, perr := strconv.ParseUint(parts[1], 10, 64)
+			if perr != nil || cursor != logHead+1 {
+				return totalSize, ErrInvalid
+			}
+			db.replayChangeBatch(cursor, pendingClear, pending)
+			logHead = cursor
+			pending = make(map[string]Change)
+			pendingClear = false
+		} else if trackChanges && strings.EqualFold(parts[0], "buntsnapshot") {
+			// 压缩快照标记：标记之前的 SET 只是快照状态而非变更，
+			// 更早的变更历史已随压缩丢弃。
+			if len(parts) != 2 {
+				return totalSize, ErrInvalid
+			}
+			cursor, perr := strconv.ParseUint(parts[1], 10, 64)
+			if perr != nil || cursor < logHead {
+				return totalSize, ErrInvalid
+			}
+			db.changeLog = db.changeLog[:0]
+			db.changeHead = cursor
+			logHead = cursor
+			pending = make(map[string]Change)
+			pendingClear = false
 		} else {
 			return totalSize, ErrInvalid
 		}
@@ -973,7 +1053,7 @@ func (db *DB) load() error {
 	if err != nil {
 		return err
 	}
-	n, err := db.readLoad(db.file, fi.ModTime())
+	n, err := db.readLoad(db.file, fi.ModTime(), true)
 	if err != nil {
 		if err == io.ErrUnexpectedEOF {
 			// The db file has ended mid-command, which is allowed but the
@@ -1142,9 +1222,9 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		tx.wc = &txWriteContext{}
 		tx.wc.rollbackItems = make(map[string]*dbItem)
 		tx.wc.rollbackIndexes = make(map[string]*index)
-		if db.persist {
-			tx.wc.commitItems = make(map[string]*dbItem)
-		}
+		// commitItems 同时承担 AOF 写入与变更订阅两种用途，
+		// 因此即使数据库以 ":memory:" 方式打开也需要初始化。
+		tx.wc.commitItems = make(map[string]*dbItem)
 	}
 	return tx, nil
 }
@@ -1209,7 +1289,14 @@ func (tx *Tx) Commit() error {
 		return ErrTxNotWritable
 	}
 	var err error
-	if tx.db.persist && (len(tx.wc.commitItems) > 0 || tx.wc.rbkeys != nil) {
+	// 只有真正改动了键空间（或执行过 DeleteAll）的提交才构成变更批次。
+	// 只读式空提交、仅创建/删除索引的提交不会产生批次，也不推进游标。
+	hasChanges := len(tx.wc.commitItems) > 0 || tx.wc.rbkeys != nil
+	cursor := tx.db.changeHead
+	if hasChanges {
+		cursor++
+	}
+	if tx.db.persist && hasChanges {
 		tx.db.buf = tx.db.buf[:0]
 		// write a flushdb if a deleteAll was called.
 		if tx.wc.rbkeys != nil {
@@ -1224,6 +1311,9 @@ func (tx *Tx) Commit() error {
 				tx.db.buf = item.writeSetTo(tx.db.buf, now)
 			}
 		}
+		// 提交边界标记与本事务的所有记录共用同一次 Write，
+		// 保证磁盘上的记录要么整事务可见、要么随截断整体丢弃。
+		tx.db.buf = appendChangeCommit(tx.db.buf, cursor)
 		// Flushing the buffer only once per transaction.
 		// If this operation fails then the write did failed and we must
 		// rollback.
@@ -1248,11 +1338,17 @@ func (tx *Tx) Commit() error {
 			}
 			tx.rollbackInner()
 		}
-		if tx.db.config.SyncPolicy == Always {
-			_ = tx.db.file.Sync()
+		if err == nil {
+			if tx.db.config.SyncPolicy == Always {
+				_ = tx.db.file.Sync()
+			}
+			// Increment the number of flushes. The background syncing uses this.
+			tx.db.flushes++
 		}
-		// Increment the number of flushes. The background syncing uses this.
-		tx.db.flushes++
+	}
+	if err == nil && hasChanges {
+		// 发布在写锁内完成且不会阻塞：仅向各订阅者的内存队列追加。
+		tx.db.publishChangeBatch(tx.wc, cursor)
 	}
 	// Unlock the database and allow for another writable transaction.
 	tx.unlock()
@@ -1553,10 +1649,8 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 		}
 	}
 	// For commits we simply assign the item to the map. We use this map to
-	// write the entry to disk.
-	if tx.db.persist {
-		tx.wc.commitItems[key] = item
-	}
+	// write the entry to disk and to publish the committed change batch.
+	tx.wc.commitItems[key] = item
 	return previousValue, replaced, nil
 }
 
@@ -1603,9 +1697,7 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 			tx.wc.rollbackItems[key] = item
 		}
 	}
-	if tx.db.persist {
-		tx.wc.commitItems[key] = nil
-	}
+	tx.wc.commitItems[key] = nil
 	// Even though the item has been deleted, we still want to check
 	// if it has expired. An expired item should not be returned.
 	if item.expired() {
@@ -2407,4 +2499,240 @@ func btreeDescendLessOrEqual(tr *btree.BTree, pivot interface{},
 func btreeNew(less func(a, b interface{}) bool) *btree.BTree {
 	// Using NewNonConcurrent because we're managing our own locks.
 	return btree.NewNonConcurrent(less)
+}
+
+// 变更订阅（Change Feed）
+//
+// 每个成功提交且改动了键空间的写事务都会恰好产生一个 ChangeBatch：
+//   - Cursor 从 1 开始连续递增，并与 AOF 中的 buntcommit 标记一一对应；
+//   - Clear 表示该事务执行过 DeleteAll（对应 AOF 中的 flushdb）；
+//   - Changes 是该事务按键名排序后的最终变更；同一键在不同事务中的
+//     连续提交属于不同批次，不会被合并。
+//
+// 回滚的事务、以及没有任何键变更的提交（包括仅创建/删除索引的事务）
+// 不产生批次，也不会推进游标。后台过期删除经由普通写事务提交，因此
+// 与手动事务遵循完全相同的提交边界。
+//
+// 每个订阅者拥有独立的内存队列，写入方只做非阻塞追加，因此订阅者
+// 暂停读取既不会长期阻塞写入，也不会丢失其加入之后的历史。游标与
+// 批次随 AOF 持久化：正常关闭重开、Shrink 压缩以及单文件复制后，
+// 都可以用上次消费的游标继续订阅；压缩点之前的历史被清除后，
+// 过早的游标会返回 ErrChangesCompacted。
+
+// Change 描述一次成功提交中某个键的最终状态。
+type Change struct {
+	// Key 是发生变更的键名。
+	Key string
+	// Value 是提交后的新值；Deleted 为 true 时无意义。
+	Value string
+	// Deleted 为 true 表示该键在本次提交中被删除。
+	Deleted bool
+}
+
+// ChangeBatch 对应一个成功提交的写事务。
+type ChangeBatch struct {
+	// Cursor 是该批次的连续递增游标，从 1 开始。
+	Cursor uint64
+	// Clear 为 true 表示事务执行过 DeleteAll，Changes 仅包含
+	// 清空之后同事务内继续写入的键（可能为空）。
+	Clear bool
+	// Changes 是按键名排序后的事务内最终变更。
+	Changes []Change
+}
+
+// ChangeSubscriber 代表一个变更订阅者。
+// 多个订阅者之间相互独立，关闭其中一个不影响其他订阅者。
+type ChangeSubscriber struct {
+	db       *DB
+	mu       sync.Mutex
+	queue    []ChangeBatch // 已投递但尚未被 Next 取走的批次
+	wake     chan struct{} // 容量为 1 的边沿通知通道
+	signaled bool          // wake 是否已经置入待处理信号
+	closed   bool
+}
+
+// SubscribeChanges 创建一个变更订阅者，仅返回游标严格大于 after 的
+// 批次（after 为调用方已确认消费的最后一个游标，传 0 表示从头开始）。
+// after 超过当前最新游标时返回 ErrInvalidOperation；after 指向的历史
+// 已被压缩清除时返回 ErrChangesCompacted。
+func (db *DB) SubscribeChanges(after uint64) (*ChangeSubscriber, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	if after > db.changeHead {
+		return nil, ErrInvalidOperation
+	}
+	if len(db.changeLog) > 0 && after < db.changeLog[0].Cursor-1 {
+		return nil, ErrChangesCompacted
+	}
+	s := &ChangeSubscriber{
+		db:   db,
+		wake: make(chan struct{}, 1),
+	}
+	// 预置订阅点之后仍保留在内存日志中的历史批次。
+	for _, batch := range db.changeLog {
+		if batch.Cursor > after {
+			s.queue = append(s.queue, batch)
+		}
+	}
+	if len(s.queue) > 0 {
+		s.signaled = true
+		s.wake <- struct{}{}
+	}
+	db.subs = append(db.subs, s)
+	return s, nil
+}
+
+// Next 返回下一个变更批次。没有新批次时阻塞等待；ctx 被取消时返回
+// ctx.Err()；数据库关闭后未取完的批次仍可继续读取，之后返回
+// ErrDatabaseClosed；订阅者已关闭时返回 ErrSubscriberClosed。
+// 传入 nil ctx 等价于 context.Background()。
+func (s *ChangeSubscriber) Next(ctx context.Context) (ChangeBatch, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		s.mu.Lock()
+		if len(s.queue) > 0 {
+			batch := s.queue[0]
+			s.queue[0] = ChangeBatch{}
+			s.queue = s.queue[1:]
+			s.mu.Unlock()
+			return batch, nil
+		}
+		if s.closed {
+			s.mu.Unlock()
+			return ChangeBatch{}, ErrSubscriberClosed
+		}
+		// 在持锁状态下重新布防信号，避免与发布者之间丢失唤醒。
+		s.signaled = false
+		ch := s.wake
+		s.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ChangeBatch{}, ctx.Err()
+		case <-s.db.closeCh:
+			return ChangeBatch{}, ErrDatabaseClosed
+		}
+	}
+}
+
+// Close 注销订阅者并解除 Next 的阻塞。可重复调用。
+func (s *ChangeSubscriber) Close() error {
+	db := s.db
+	db.mu.Lock()
+	for i, sub := range db.subs {
+		if sub == s {
+			s.db.subs = append(db.subs[:i], db.subs[i+1:]...)
+			break
+		}
+	}
+	db.mu.Unlock()
+	s.mu.Lock()
+	closed := s.closed
+	if !closed {
+		s.closed = true
+		if !s.signaled {
+			s.signaled = true
+			select {
+			case s.wake <- struct{}{}:
+			default:
+			}
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// enqueue 由写事务在 db.mu 写锁内调用，向订阅者队列非阻塞追加批次。
+func (s *ChangeSubscriber) enqueue(batch ChangeBatch) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.queue = append(s.queue, batch)
+	if !s.signaled {
+		s.signaled = true
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+}
+
+// publishChangeBatch 推进游标、保留内存日志并投递给所有订阅者。
+// 调用方必须持有 db.mu 写锁。
+func (db *DB) publishChangeBatch(wc *txWriteContext, cursor uint64) {
+	batch := ChangeBatch{
+		Cursor:  cursor,
+		Clear:   wc.rbkeys != nil,
+		Changes: sortedChangesFromCommit(wc.commitItems),
+	}
+	db.changeHead = cursor
+	db.changeLog = append(db.changeLog, batch)
+	for _, s := range db.subs {
+		s.enqueue(batch)
+	}
+}
+
+// replayChangeBatch 在加载 AOF 时重建一个历史批次。
+// 调用方必须持有 db.mu 写锁（Open 加载阶段）或处于 Load 上下文中。
+func (db *DB) replayChangeBatch(cursor uint64, clear bool,
+	pending map[string]Change) {
+	batch := ChangeBatch{
+		Cursor:  cursor,
+		Clear:   clear,
+		Changes: sortedChangesFromPending(pending),
+	}
+	db.changeHead = cursor
+	db.changeLog = append(db.changeLog, batch)
+}
+
+func sortedChangesFromCommit(items map[string]*dbItem) []Change {
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	changes := make([]Change, 0, len(keys))
+	for _, key := range keys {
+		if item := items[key]; item == nil {
+			changes = append(changes, Change{Key: key, Deleted: true})
+		} else {
+			changes = append(changes, Change{Key: key, Value: item.val})
+		}
+	}
+	return changes
+}
+
+func sortedChangesFromPending(pending map[string]Change) []Change {
+	keys := make([]string, 0, len(pending))
+	for key := range pending {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	changes := make([]Change, 0, len(keys))
+	for _, key := range keys {
+		changes = append(changes, pending[key])
+	}
+	return changes
+}
+
+// appendChangeCommit 写入事务提交边界标记，参数为该批次的游标。
+func appendChangeCommit(buf []byte, cursor uint64) []byte {
+	buf = appendArray(buf, 2)
+	buf = appendBulkString(buf, "buntcommit")
+	return appendBulkString(buf, strconv.FormatUint(cursor, 10))
+}
+
+// appendChangeSnapshot 写入压缩快照边界标记，参数为快照所代表的游标。
+func appendChangeSnapshot(buf []byte, cursor uint64) []byte {
+	buf = appendArray(buf, 2)
+	buf = appendBulkString(buf, "buntsnapshot")
+	return appendBulkString(buf, strconv.FormatUint(cursor, 10))
 }
