@@ -6,6 +6,7 @@ package buntdb
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -60,6 +61,12 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrIndexModified is returned from an online index replacement when the
+	// index with the same name has been created, dropped, or replaced by another
+	// operation while the online replacement was in progress. The unfinished
+	// index is discarded and the newer definition is left untouched.
+	ErrIndexModified = errors.New("index modified")
 )
 
 const useAbsEx = true
@@ -80,6 +87,16 @@ type DB struct {
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+
+	// idxGens holds a monotonically increasing generation counter per index
+	// name. It is bumped whenever the definition of an index name changes
+	// (create, drop, replace) but never for plain data mutations. Online
+	// index replacements use it to detect concurrent redefinitions.
+	idxGens map[string]uint64
+	// builds is the set of active online index builds. Every committed data
+	// mutation is forwarded to each feed so the in-progress indexes can catch
+	// up without holding the database write lock.
+	builds map[*idxBuildFeed]struct{}
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -147,6 +164,8 @@ func Open(path string) (*DB, error) {
 	db.keys = btreeNew(lessCtx(nil))
 	db.exps = btreeNew(lessCtx(&exctx{db}))
 	db.idxs = make(map[string]*index)
+	db.idxGens = make(map[string]uint64)
+	db.builds = make(map[*idxBuildFeed]struct{})
 	// initialize default configuration
 	db.config = Config{
 		SyncPolicy:           EverySecond,
@@ -323,6 +342,150 @@ func (idx *index) rebuild() {
 	})
 }
 
+// changeKind describes the kind of a committed database mutation.
+type changeKind int
+
+const (
+	changeSet    changeKind = iota + 1 // an item was inserted or overwritten
+	changeDelete                       // an item was deleted
+	changeFlush                        // the whole database was cleared
+)
+
+// dbChange is a single committed mutation forwarded to in-progress online
+// index builds. Instances are treated as immutable once dispatched.
+type dbChange struct {
+	kind changeKind
+	item *dbItem // the new item, for changeSet
+	prev *dbItem // the overwritten or removed item, if any
+}
+
+// idxBuildFeed is the per-build queue of committed mutations. Publishers
+// (commit path) already hold the database write lock; the online builder drains
+// the queue without holding any database lock.
+type idxBuildFeed struct {
+	mu      sync.Mutex
+	name    string // the index name being built
+	changes []dbChange
+}
+
+// push appends committed changes to the feed. It is called while the database
+// write lock is held.
+func (f *idxBuildFeed) push(changes []dbChange) {
+	if len(changes) == 0 {
+		return
+	}
+	f.mu.Lock()
+	f.changes = append(f.changes, changes...)
+	f.mu.Unlock()
+}
+
+// drain removes and returns all queued changes.
+func (f *idxBuildFeed) drain() []dbChange {
+	f.mu.Lock()
+	changes := f.changes
+	f.changes = nil
+	f.mu.Unlock()
+	return changes
+}
+
+// onlineIndexBuilder wraps a private, not-yet-published index and keeps it
+// consistent with the live database while the business keeps reading and
+// writing. Items observed during the chunked backfill and items received
+// through the change feed are reconciled through the "cur" map, which always
+// holds the exact *dbItem currently stored in the candidate trees for a key.
+// This makes backfill observations and ordered change entries converge to the
+// committed state at publish time regardless of their interleaving.
+type onlineIndexBuilder struct {
+	idx *index
+	cur map[string]*dbItem
+}
+
+func newOnlineIndexBuilder(idx *index) *onlineIndexBuilder {
+	return &onlineIndexBuilder{idx: idx, cur: make(map[string]*dbItem)}
+}
+
+func (b *onlineIndexBuilder) remove(dbi *dbItem) {
+	if b.idx.btr != nil {
+		b.idx.btr.Delete(dbi)
+	}
+	if b.idx.rtr != nil {
+		b.idx.rtr.Remove(dbi)
+	}
+}
+
+func (b *onlineIndexBuilder) insert(dbi *dbItem) {
+	if b.idx.btr != nil {
+		b.idx.btr.Set(dbi)
+	}
+	if b.idx.rtr != nil {
+		b.idx.rtr.Insert(dbi)
+	}
+}
+
+// reset empties the candidate after a committed DeleteAll.
+func (b *onlineIndexBuilder) reset() {
+	if b.idx.btr != nil {
+		b.idx.btr = btreeNew(lessCtx(b.idx))
+	}
+	if b.idx.rtr != nil {
+		b.idx.rtr = rtred.New(b.idx)
+	}
+	for key := range b.cur {
+		delete(b.cur, key)
+	}
+}
+
+// upsert reconciles a single item observed via backfill or change feed.
+func (b *onlineIndexBuilder) upsert(dbi *dbItem) {
+	if !b.idx.match(dbi.key) {
+		// Index membership depends on the immutable key only, so a present
+		// entry here is defensive and should never occur.
+		if old, ok := b.cur[dbi.key]; ok {
+			b.remove(old)
+			delete(b.cur, dbi.key)
+		}
+		return
+	}
+	if old, ok := b.cur[dbi.key]; ok {
+		if old == dbi {
+			// The exact same item is already published in the candidate.
+			return
+		}
+		b.remove(old)
+	}
+	b.insert(dbi)
+	b.cur[dbi.key] = dbi
+}
+
+// deleteKey reconciles a committed deletion.
+func (b *onlineIndexBuilder) deleteKey(key string) {
+	if old, ok := b.cur[key]; ok {
+		b.remove(old)
+		delete(b.cur, key)
+	}
+}
+
+// apply replays one committed change in commit order.
+func (b *onlineIndexBuilder) apply(change dbChange) {
+	switch change.kind {
+	case changeSet:
+		b.upsert(change.item)
+	case changeDelete:
+		b.deleteKey(change.prev.key)
+	case changeFlush:
+		b.reset()
+	}
+}
+
+// onlineIndexChunkItems is the maximum number of items scanned per backfill
+// chunk. Between chunks the read lock is released so business writes are only
+// blocked for brief moments.
+var onlineIndexChunkItems = 1000
+
+// onlineIndexChunkHook, when non-nil, is invoked once per backfill chunk
+// iteration. It exists solely as a deterministic test hook.
+var onlineIndexChunkHook func()
+
 // CreateIndex builds a new index and populates it with items.
 // The items are ordered in an b-tree and can be retrieved using the
 // Ascend* and Descend* methods.
@@ -408,6 +571,152 @@ func (db *DB) ReplaceSpatialIndex(name, pattern string,
 		}
 		return nil
 	})
+}
+
+// ReplaceIndexOnline is the online variant of ReplaceIndex. It builds a new
+// b-tree index without holding the database write lock for the whole rebuild:
+// the previous index and all normal reads and writes keep working while the
+// build is in progress. If no index with the name exists yet, a new one is
+// created.
+//
+// On success the published index accurately reflects every add, overwrite,
+// delete, DeleteAll and expiry removal that had committed before the publish;
+// writes that were rolled back are never included.
+//
+// The build ends safely, without publishing anything, when ctx is canceled,
+// when the database is closed, or when the same-named index has been changed by
+// another operation in the meantime (ErrIndexModified is returned and the
+// newer definition is kept).
+func (db *DB) ReplaceIndexOnline(ctx context.Context, name, pattern string,
+	less ...func(a, b string) bool) error {
+	return db.replaceIndexOnline(ctx, name, pattern, less, nil, nil)
+}
+
+// ReplaceSpatialIndexOnline is the online variant of ReplaceSpatialIndex. It
+// behaves like ReplaceIndexOnline but builds an r-tree index populated through
+// the rect function and queried with Intersects or Nearby.
+func (db *DB) ReplaceSpatialIndexOnline(ctx context.Context, name, pattern string,
+	rect func(item string) (min, max []float64)) error {
+	return db.replaceIndexOnline(ctx, name, pattern, nil, rect, nil)
+}
+
+// replaceIndexOnline is the shared implementation of the online replacement
+// entry points.
+//
+// It performs three phases:
+//
+//  1. Register a private change feed and remember the current index
+//     generation. From this point on every committed mutation is recorded.
+//  2. Backfill the candidate in small chunks using read transactions. The
+//     database lock is released between chunks, and observed items are merged
+//     with the change feed so the candidate converges to the live state.
+//  3. Inside a single write transaction, stop the feed, replay the remaining
+//     changes, verify the index generation, and atomically swap the candidate
+//     into place. Any failure before the swap discards the candidate.
+func (db *DB) replaceIndexOnline(ctx context.Context, name, pattern string,
+	lessers []func(a, b string) bool,
+	rect func(item string) (min, max []float64),
+	opts *IndexOptions,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	candidate, err := newDatabaseIndex(db, name, pattern, lessers, rect, opts)
+	if err != nil {
+		return err
+	}
+	builder := newOnlineIndexBuilder(candidate)
+
+	// Phase 1: register the feed and snapshot the generation under the
+	// write lock.
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return ErrDatabaseClosed
+	}
+	feed := &idxBuildFeed{name: name}
+	db.builds[feed] = struct{}{}
+	gen0 := db.idxGens[name]
+	db.mu.Unlock()
+	unregister := func() {
+		db.mu.Lock()
+		delete(db.builds, feed)
+		db.mu.Unlock()
+	}
+
+	// Phase 2: chunked backfill. Each chunk runs in a read transaction so
+	// readers are never blocked and writers only wait for the duration of a
+	// chunk. Committed changes that happen in between are replayed after
+	// every chunk to keep the candidate converging with the live state.
+	pivot := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			unregister()
+			return err
+		}
+		if onlineIndexChunkHook != nil {
+			onlineIndexChunkHook()
+		}
+		atEnd := true
+		err := db.View(func(tx *Tx) error {
+			n := 0
+			btreeAscendGreaterOrEqual(tx.db.keys, &dbItem{key: pivot},
+				func(item interface{}) bool {
+					if n >= onlineIndexChunkItems {
+						// Resume from this key in the next chunk.
+						atEnd = false
+						return false
+					}
+					dbi := item.(*dbItem)
+					pivot = dbi.key
+					n++
+					builder.upsert(dbi)
+					return true
+				})
+			return nil
+		})
+		if err != nil {
+			unregister()
+			return err
+		}
+		for _, change := range feed.drain() {
+			builder.apply(change)
+		}
+		if atEnd {
+			break
+		}
+	}
+
+	// Phase 3: finalize atomically. The write lock guarantees that no
+	// mutation can commit between the final drain and the swap.
+	finalized := false
+	err = db.Update(func(tx *Tx) error {
+		// Stop receiving changes before draining; no other commit can run
+		// concurrently with this write transaction.
+		delete(db.builds, feed)
+		finalized = true
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for _, change := range feed.drain() {
+			builder.apply(change)
+		}
+		if db.idxGens[name] != gen0 {
+			// The same-named index was created, dropped or replaced by
+			// someone else. Refuse to overwrite the newer definition.
+			return ErrIndexModified
+		}
+		tx.installBuiltIndex(name, candidate, gen0)
+		return nil
+	})
+	if err != nil && !finalized {
+		// Begin() failed (database closed) so the feed is still registered.
+		unregister()
+	}
+	return err
 }
 
 // DropIndex removes an index.
@@ -956,6 +1265,12 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			db.keys = btreeNew(lessCtx(nil))
 			db.exps = btreeNew(lessCtx(&exctx{db}))
 			db.idxs = make(map[string]*index)
+			// A load replaces the whole dataset and wipes every index
+			// outside of transaction handling. Invalidate any online index
+			// build so it cannot publish an index against the reset state.
+			for feed := range db.builds {
+				db.idxGens[feed.name]++
+			}
 		} else {
 			return totalSize, ErrInvalid
 		}
@@ -1083,6 +1398,17 @@ type txWriteContext struct {
 	commitItems     map[string]*dbItem // details for committing tx.
 	itercount       int                // stack of iterators
 	rollbackIndexes map[string]*index  // details for dropped indexes.
+
+	// changes are the data mutations performed by this transaction. They are
+	// only forwarded to online index builds when the transaction commits;
+	// a rollback discards them.
+	changes []dbChange
+	// rollbackRestore records indexes published by an online replacement, so
+	// a rollback restores the previous index object as-is (nil means the
+	// index did not exist and must be removed).
+	rollbackRestore map[string]*index
+	// rollbackGens restores index definition generations on rollback.
+	rollbackGens map[string]uint64
 }
 
 // DeleteAll deletes all items from the database.
@@ -1116,6 +1442,9 @@ func (tx *Tx) DeleteAll() error {
 	// always clear out the commits
 	tx.wc.commitItems = make(map[string]*dbItem)
 
+	// notify online index builds that the whole database was cleared.
+	tx.wc.changes = append(tx.wc.changes, dbChange{kind: changeFlush})
+
 	return nil
 }
 
@@ -1142,6 +1471,8 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		tx.wc = &txWriteContext{}
 		tx.wc.rollbackItems = make(map[string]*dbItem)
 		tx.wc.rollbackIndexes = make(map[string]*index)
+		tx.wc.rollbackRestore = make(map[string]*index)
+		tx.wc.rollbackGens = make(map[string]uint64)
 		if db.persist {
 			tx.wc.commitItems = make(map[string]*dbItem)
 		}
@@ -1193,6 +1524,19 @@ func (tx *Tx) rollbackInner() {
 			tx.db.idxs[name] = idx
 			idx.rebuild()
 		}
+	}
+	for name, idx := range tx.wc.rollbackRestore {
+		// Restore indexes atomically published by an online replacement.
+		// The previous index object is still fully populated, so no rebuild
+		// is needed.
+		if idx == nil {
+			delete(tx.db.idxs, name)
+		} else {
+			tx.db.idxs[name] = idx
+		}
+	}
+	for name, gen := range tx.wc.rollbackGens {
+		tx.db.idxGens[name] = gen
 	}
 }
 
@@ -1254,11 +1598,27 @@ func (tx *Tx) Commit() error {
 		// Increment the number of flushes. The background syncing uses this.
 		tx.db.flushes++
 	}
+	if err == nil {
+		// Forward committed mutations to any in-progress online index
+		// builds. Rolled-back transactions never reach this point.
+		tx.db.dispatchChanges(tx.wc.changes)
+	}
 	// Unlock the database and allow for another writable transaction.
 	tx.unlock()
 	// Clear the db field to disable this transaction from future use.
 	tx.db = nil
 	return err
+}
+
+// dispatchChanges forwards committed mutations to all active online index
+// builds. It must be called while holding the database write lock.
+func (db *DB) dispatchChanges(changes []dbChange) {
+	if len(changes) == 0 || len(db.builds) == 0 {
+		return
+	}
+	for feed := range db.builds {
+		feed.push(changes)
+	}
 }
 
 // Rollback closes the transaction and reverts all mutable operations that
@@ -1529,6 +1889,14 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	// Insert the item into the keys tree.
 	prev := tx.db.insertIntoDatabase(item)
 
+	// record the mutation for online index builds. It is discarded if the
+	// transaction ends up rolling back.
+	tx.wc.changes = append(tx.wc.changes, dbChange{
+		kind: changeSet,
+		item: item,
+		prev: prev,
+	})
+
 	// insert into the rollback map if there has not been a deleteAll.
 	if tx.wc.rbkeys == nil {
 		if prev == nil {
@@ -1597,6 +1965,12 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 	if item == nil {
 		return "", ErrNotFound
 	}
+	// record the mutation for online index builds. It is discarded if the
+	// transaction ends up rolling back.
+	tx.wc.changes = append(tx.wc.changes, dbChange{
+		kind: changeDelete,
+		prev: item,
+	})
 	// create a rollback entry if there has not been a deleteAll call.
 	if tx.wc.rbkeys == nil {
 		if _, ok := tx.wc.rollbackItems[key]; !ok {
@@ -2104,28 +2478,17 @@ func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	return tx.createIndex(name, pattern, nil, rect, nil)
 }
 
-// createIndex is called by CreateIndex() and CreateSpatialIndex()
-func (tx *Tx) createIndex(name string, pattern string,
+// newDatabaseIndex builds an empty index object from its definition. It is
+// shared by the synchronous index creation and the online replacement flow.
+func newDatabaseIndex(db *DB, name, pattern string,
 	lessers []func(a, b string) bool,
 	rect func(item string) (min, max []float64),
 	opts *IndexOptions,
-) error {
-	if tx.db == nil {
-		return ErrTxClosed
-	} else if !tx.writable {
-		return ErrTxNotWritable
-	} else if tx.wc.itercount > 0 {
-		return ErrTxIterating
-	}
+) (*index, error) {
 	if name == "" {
 		// cannot create an index without a name.
 		// an empty name index is designated for the main "keys" tree.
-		return ErrIndexExists
-	}
-	// check if an index with that name already exists.
-	if _, ok := tx.db.idxs[name]; ok {
-		// index with name already exists. error.
-		return ErrIndexExists
+		return nil, ErrIndexExists
 	}
 	// genreate a less function
 	var less func(a, b string) bool
@@ -2162,12 +2525,46 @@ func (tx *Tx) createIndex(name string, pattern string,
 		pattern: pattern,
 		less:    less,
 		rect:    rect,
-		db:      tx.db,
+		db:      db,
 		opts:    sopts,
+	}
+	// initialize with empty trees
+	if idx.less != nil {
+		idx.btr = btreeNew(lessCtx(idx))
+	}
+	if idx.rect != nil {
+		idx.rtr = rtred.New(idx)
+	}
+	return idx, nil
+}
+
+// createIndex is called by CreateIndex() and CreateSpatialIndex()
+func (tx *Tx) createIndex(name string, pattern string,
+	lessers []func(a, b string) bool,
+	rect func(item string) (min, max []float64),
+	opts *IndexOptions,
+) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	} else if !tx.writable {
+		return ErrTxNotWritable
+	} else if tx.wc.itercount > 0 {
+		return ErrTxIterating
+	}
+	// check if an index with that name already exists.
+	if _, ok := tx.db.idxs[name]; ok {
+		// index with name already exists. error.
+		return ErrIndexExists
+	}
+	idx, err := newDatabaseIndex(tx.db, name, pattern, lessers, rect, opts)
+	if err != nil {
+		return err
 	}
 	idx.rebuild()
 	// save the index
 	tx.db.idxs[name] = idx
+	tx.rememberIndexGen(name)
+	tx.db.idxGens[name]++
 	if tx.wc.rbkeys == nil {
 		// store the index in the rollback map.
 		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
@@ -2177,6 +2574,31 @@ func (tx *Tx) createIndex(name string, pattern string,
 		}
 	}
 	return nil
+}
+
+// rememberIndexGen records the pre-mutation generation of an index name once
+// per transaction, so a rollback can restore it.
+func (tx *Tx) rememberIndexGen(name string) {
+	if tx.wc.rbkeys != nil {
+		return
+	}
+	if _, ok := tx.wc.rollbackGens[name]; !ok {
+		tx.wc.rollbackGens[name] = tx.db.idxGens[name]
+	}
+}
+
+// installBuiltIndex atomically publishes a fully built online index. The
+// previous index object is kept intact for rollback.
+func (tx *Tx) installBuiltIndex(name string, idx *index, gen0 uint64) {
+	old := tx.db.idxs[name]
+	if tx.wc.rbkeys == nil {
+		if _, ok := tx.wc.rollbackRestore[name]; !ok {
+			tx.wc.rollbackRestore[name] = old
+		}
+		tx.rememberIndexGen(name)
+	}
+	tx.db.idxs[name] = idx
+	tx.db.idxGens[name] = gen0 + 1
 }
 
 // DropIndex removes an index.
@@ -2199,6 +2621,8 @@ func (tx *Tx) DropIndex(name string) error {
 	// delete from the map.
 	// this is all that is needed to delete an index.
 	delete(tx.db.idxs, name)
+	tx.rememberIndexGen(name)
+	tx.db.idxGens[name]++
 	if tx.wc.rbkeys == nil {
 		// store the index in the rollback map.
 		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
